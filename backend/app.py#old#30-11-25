@@ -1,0 +1,605 @@
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import os
+import mysql.connector
+from database import create_connection, init_db
+from docx_parser import DocxQuestionParser
+from werkzeug.utils import secure_filename
+import json
+import traceback
+from datetime import datetime
+import re  # Add this import for language detection
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+ALLOWED_EXTENSIONS = {'docx'}
+
+# Initialize database
+init_db()
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_language_detection(text):
+    """Enhanced language detection with better accuracy"""
+    if not text:
+        return 'english'
+    
+    # Count Hindi and English characters
+    hindi_chars = len(re.findall(r'[\u0900-\u097F]', text))
+    english_chars = len(re.findall(r'[a-zA-Z]', text))
+    
+    # If Hindi characters significantly outnumber English, it's Hindi
+    if hindi_chars > english_chars * 0.5:  # More flexible threshold
+        return 'hindi'
+    return 'english'
+
+@app.route('/api/upload-questions', methods=['POST'])
+def upload_questions():
+    """Upload and parse DOCX questions with enhanced error handling"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not file or not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type. Please upload .docx files only.'}), 400
+
+    # Secure filename and save
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    
+    try:
+        file.save(file_path)
+        print(f"✅ File saved: {file_path}")
+    except Exception as e:
+        return jsonify({'error': f'Error saving file: {str(e)}'}), 500
+    
+    try:
+        # Parse the DOCX file
+        parser = DocxQuestionParser(app.config['UPLOAD_FOLDER'])
+        questions = parser.parse_docx(file_path)
+        
+        print(f"📊 Parsed {len(questions)} questions")
+        
+        # Enhanced language detection and statistics
+        language_stats = {
+            'english': 0,
+            'hindi': 0,
+            'with_images': 0,
+            'multiple_choice': 0,
+            'other_types': 0
+        }
+        
+        # Debug print and statistics
+        for i, q in enumerate(questions):
+            language = get_language_detection(q.get('question_text', ''))
+            if language == "hindi":
+                language_stats['hindi'] += 1
+            else:
+                language_stats['english'] += 1
+            
+            if q.get('image_path'):
+                language_stats['with_images'] += 1
+            
+            if q.get('type') == 'multiple_choice':
+                language_stats['multiple_choice'] += 1
+            else:
+                language_stats['other_types'] += 1
+                
+            print(f"📝 Question {i+1} ({language}): {q.get('question_text', '')[:80]}...")
+        
+        print(f"📈 Language Summary: {language_stats}")
+        
+        # Save to database with transaction
+        connection = create_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed'}), 500
+        
+        try:
+            cursor = connection.cursor()
+            inserted_ids = []
+            skipped_questions = 0
+            
+            for question in questions:
+                # Skip questions without text
+                if not question.get('question_text', '').strip():
+                    skipped_questions += 1
+                    continue
+                
+                cursor.execute('''
+                    INSERT INTO questions 
+                    (question_text, question_html, question_type, options, correct_answer, 
+                     solution, marks, image_path, language, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    question.get('question_text', ''),
+                    question.get('question_text', ''),  # Using same as HTML for now
+                    question.get('type', 'multiple_choice'),
+                    json.dumps(question.get('options', [])),
+                    question.get('correct_answer', ''),
+                    question.get('solution', ''),
+                    question.get('marks', 1),
+                    question.get('image_path'),
+                    get_language_detection(question.get('question_text', '')),
+                    datetime.now()
+                ))
+                inserted_ids.append(cursor.lastrowid)
+            
+            connection.commit()
+            
+            return jsonify({
+                'message': f'Successfully uploaded {len(inserted_ids)} questions ({skipped_questions} skipped)',
+                'question_ids': inserted_ids,
+                'summary': {
+                    'total_parsed': len(questions),
+                    'total_saved': len(inserted_ids),
+                    'skipped': skipped_questions,
+                    'english': language_stats['english'],
+                    'hindi': language_stats['hindi'],
+                    'with_images': language_stats['with_images'],
+                    'multiple_choice': language_stats['multiple_choice'],
+                    'other_types': language_stats['other_types']
+                }
+            }), 200
+            
+        except Exception as db_error:
+            connection.rollback()
+            print(f"❌ Database error: {db_error}")
+            return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+        finally:
+            cursor.close()
+            connection.close()
+        
+    except Exception as e:
+        print(f"❌ Error parsing file: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'error': f'Error parsing file: {str(e)}'}), 500
+    finally:
+        # Clean up uploaded file
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"🧹 Cleaned up: {file_path}")
+        except Exception as cleanup_error:
+            print(f"⚠️ Error cleaning up file: {cleanup_error}")
+
+@app.route('/api/questions', methods=['GET'])
+def get_questions():
+    """Get all questions with pagination and filtering support"""
+    try:
+        # Get query parameters
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        language = request.args.get('language', '')
+        question_type = request.args.get('type', '')
+        
+        connection = create_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed'}), 500
+        
+        cursor = connection.cursor(dictionary=True)
+        
+        # Build query with filters
+        base_query = 'SELECT * FROM questions WHERE 1=1'
+        count_query = 'SELECT COUNT(*) as total FROM questions WHERE 1=1'
+        params = []
+        
+        if language:
+            base_query += ' AND language = %s'
+            count_query += ' AND language = %s'
+            params.append(language)
+        
+        if question_type:
+            base_query += ' AND question_type = %s'
+            count_query += ' AND question_type = %s'
+            params.append(question_type)
+        
+        # Add ordering and pagination
+        base_query += ' ORDER BY created_at DESC LIMIT %s OFFSET %s'
+        offset = (page - 1) * per_page
+        params.extend([per_page, offset])
+        
+        # Get total count
+        cursor.execute(count_query, params[:-2] if language or question_type else [])
+        total_result = cursor.fetchone()
+        total_questions = total_result['total'] if total_result else 0
+        
+        # Get paginated questions
+        cursor.execute(base_query, params)
+        questions = cursor.fetchall()
+        
+        # Parse JSON options
+        for question in questions:
+            if question['options']:
+                try:
+                    question['options'] = json.loads(question['options'])
+                except:
+                    question['options'] = []
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            'questions': questions,
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total_questions,
+                'pages': (total_questions + per_page - 1) // per_page
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error fetching questions: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/questions/<int:question_id>', methods=['GET', 'PUT', 'DELETE'])
+def manage_question(question_id):
+    """Manage individual questions (GET, UPDATE, DELETE)"""
+    connection = create_connection()
+    if not connection:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        if request.method == 'GET':
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute('SELECT * FROM questions WHERE id = %s', (question_id,))
+            question = cursor.fetchone()
+            
+            if question:
+                # Parse JSON options
+                if question['options']:
+                    try:
+                        question['options'] = json.loads(question['options'])
+                    except:
+                        question['options'] = []
+                
+                cursor.close()
+                connection.close()
+                return jsonify(question), 200
+            else:
+                cursor.close()
+                connection.close()
+                return jsonify({'error': 'Question not found'}), 404
+        
+        elif request.method == 'PUT':
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'No JSON data provided'}), 400
+            
+            cursor = connection.cursor()
+            
+            cursor.execute('''
+                UPDATE questions 
+                SET question_text = %s, question_type = %s, options = %s, 
+                    correct_answer = %s, solution = %s, marks = %s,
+                    image_path = %s, language = %s, updated_at = %s
+                WHERE id = %s
+            ''', (
+                data.get('question_text', ''),
+                data.get('question_type', 'multiple_choice'),
+                json.dumps(data.get('options', [])),
+                data.get('correct_answer', ''),
+                data.get('solution', ''),
+                data.get('marks', 1),
+                data.get('image_path', ''),
+                get_language_detection(data.get('question_text', '')),
+                datetime.now(),
+                question_id
+            ))
+            
+            if cursor.rowcount == 0:
+                connection.rollback()
+                cursor.close()
+                connection.close()
+                return jsonify({'error': 'Question not found'}), 404
+            
+            connection.commit()
+            cursor.close()
+            connection.close()
+            
+            return jsonify({'message': 'Question updated successfully'}), 200
+        
+        elif request.method == 'DELETE':
+            cursor = connection.cursor()
+            cursor.execute('DELETE FROM questions WHERE id = %s', (question_id,))
+            
+            if cursor.rowcount == 0:
+                connection.rollback()
+                cursor.close()
+                connection.close()
+                return jsonify({'error': 'Question not found'}), 404
+            
+            connection.commit()
+            cursor.close()
+            connection.close()
+            
+            return jsonify({'message': 'Question deleted successfully'}), 200
+            
+    except Exception as e:
+        connection.rollback()
+        print(f"❌ Error in manage_question: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/questions/filter', methods=['GET'])
+def filter_questions():
+    """Filter questions by language with enhanced options"""
+    language = request.args.get('language', '').lower()
+    question_type = request.args.get('type', '')
+    has_images = request.args.get('has_images', '').lower()
+    
+    if language and language not in ['english', 'hindi']:
+        return jsonify({'error': 'Language must be "english" or "hindi"'}), 400
+    
+    connection = create_connection()
+    if not connection:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        query = 'SELECT * FROM questions WHERE 1=1'
+        params = []
+        
+        if language:
+            query += ' AND language = %s'
+            params.append(language)
+        
+        if question_type:
+            query += ' AND question_type = %s'
+            params.append(question_type)
+        
+        if has_images == 'true':
+            query += ' AND image_path IS NOT NULL'
+        elif has_images == 'false':
+            query += ' AND image_path IS NULL'
+        
+        query += ' ORDER BY created_at DESC'
+        
+        cursor.execute(query, params)
+        questions = cursor.fetchall()
+        
+        # Parse JSON options
+        for question in questions:
+            if question['options']:
+                try:
+                    question['options'] = json.loads(question['options'])
+                except:
+                    question['options'] = []
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            'questions': questions,
+            'filters': {
+                'language': language,
+                'type': question_type,
+                'has_images': has_images,
+                'count': len(questions)
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error filtering questions: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/questions/stats', methods=['GET'])
+def get_question_stats():
+    """Get comprehensive question statistics"""
+    connection = create_connection()
+    if not connection:
+        return jsonify({'error': 'Database connection failed'}), 500
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        # Total questions by language
+        cursor.execute('''
+            SELECT language, COUNT(*) as count 
+            FROM questions 
+            GROUP BY language
+        ''')
+        language_stats = cursor.fetchall()
+        
+        # Questions by type
+        cursor.execute('''
+            SELECT question_type, COUNT(*) as count 
+            FROM questions 
+            GROUP BY question_type
+        ''')
+        type_stats = cursor.fetchall()
+        
+        # Questions with images
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total,
+                COUNT(image_path) as with_images,
+                COUNT(*) - COUNT(image_path) as without_images
+            FROM questions
+        ''')
+        image_stats = cursor.fetchone()
+        
+        # Recent activity
+        cursor.execute('''
+            SELECT 
+                DATE(created_at) as date,
+                COUNT(*) as count
+            FROM questions 
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+        ''')
+        recent_activity = cursor.fetchall()
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            'language_distribution': language_stats,
+            'type_distribution': type_stats,
+            'image_stats': image_stats,
+            'recent_activity': recent_activity,
+            'summary': {
+                'total_questions': image_stats['total'] if image_stats else 0,
+                'total_with_images': image_stats['with_images'] if image_stats else 0,
+                'total_languages': len(language_stats),
+                'total_types': len(type_stats)
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error getting stats: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# @app.route('/api/images/<path:filename>')
+# def serve_image(filename):
+#     """Serve uploaded images with enhanced error handling"""
+#     try:
+#         # Handle different path formats
+#         if '\\' in filename:
+#             filename = filename.replace('\\', '/')
+        
+#         # Extract just the filename if full path is provided
+#         actual_filename = os.path.basename(filename)
+#         image_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images', actual_filename)
+        
+#         print(f"🔍 Looking for image at: {image_path}")
+        
+#         if os.path.exists(image_path):
+#             print(f"✅ Serving image: {actual_filename}")
+#             return send_file(image_path)
+#         else:
+#             print(f"❌ Image not found: {image_path}")
+#             # Try to find the image with different extensions
+#             images_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'images')
+#             if os.path.exists(images_dir):
+#                 image_files = os.listdir(images_dir)
+#                 base_name = os.path.splitext(actual_filename)[0]
+#                 matching_files = [f for f in image_files if f.startswith(base_name)]
+                
+#                 if matching_files:
+#                     actual_filename = matching_files[0]
+#                     image_path = os.path.join(images_dir, actual_filename)
+#                     print(f"🔄 Found alternative image: {actual_filename}")
+#                     return send_file(image_path)
+            
+#             return jsonify({'error': 'Image not found'}), 404
+            
+#     except Exception as e:
+#         print(f"❌ Error serving image {filename}: {e}")
+#         return jsonify({'error': 'Image serving error'}), 500
+
+
+@app.route('/api/images/<path:filename>')
+def serve_image(filename):
+    """Serve uploaded images with enhanced error handling"""
+    try:
+        # Handle different path formats
+        if '\\' in filename:
+            filename = filename.replace('\\', '/')
+        
+        # Extract just the filename if full path is provided
+        actual_filename = os.path.basename(filename)
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images', actual_filename)
+        
+        print(f"🔍 Looking for image at: {image_path}")
+        
+        if os.path.exists(image_path):
+            print(f"✅ Serving image: {actual_filename}")
+            return send_file(image_path)
+        else:
+            print(f"❌ Image not found: {image_path}")
+            # Try to find the image with different extensions
+            images_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'images')
+            if os.path.exists(images_dir):
+                image_files = os.listdir(images_dir)
+                base_name = os.path.splitext(actual_filename)[0]
+                matching_files = [f for f in image_files if f.startswith(base_name)]
+                
+                if matching_files:
+                    actual_filename = matching_files[0]
+                    image_path = os.path.join(images_dir, actual_filename)
+                    print(f"🔄 Found alternative image: {actual_filename}")
+                    return send_file(image_path)
+            
+            return jsonify({'error': 'Image not found'}), 404
+            
+    except Exception as e:
+        print(f"❌ Error serving image {filename}: {e}")
+        return jsonify({'error': 'Image serving error'}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Enhanced health check with system status"""
+    db_status = 'healthy'
+    try:
+        connection = create_connection()
+        if connection:
+            connection.close()
+        else:
+            db_status = 'unhealthy'
+    except:
+        db_status = 'unhealthy'
+    
+    # Check upload directory
+    upload_dir_status = 'healthy' if os.path.exists(app.config['UPLOAD_FOLDER']) else 'unhealthy'
+    images_dir_status = 'healthy' if os.path.exists(os.path.join(app.config['UPLOAD_FOLDER'], 'images')) else 'unhealthy'
+    
+    return jsonify({
+        'status': 'healthy', 
+        'message': 'Exam Portal API is running',
+        'timestamp': datetime.now().isoformat(),
+        'system': {
+            'database': db_status,
+            'upload_directory': upload_dir_status,
+            'images_directory': images_dir_status
+        },
+        'features': {
+            'multiple_languages': True,
+            'separate_questions': True,
+            'image_support': True,
+            'language_filtering': True,
+            'pagination': True,
+            'statistics': True
+        },
+        'limits': {
+            'max_file_size': '16MB',
+            'allowed_extensions': list(ALLOWED_EXTENSIONS)
+        }
+    })
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(413)
+def too_large(error):
+    return jsonify({'error': 'File too large. Maximum size is 16MB.'}), 413
+
+if __name__ == '__main__':
+    # Create necessary directories
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'images'), exist_ok=True)
+    
+    print("🚀 Starting Enhanced Exam Portal API...")
+    print("📁 Upload folder:", app.config['UPLOAD_FOLDER'])
+    print("🌍 Multi-language support: ENABLED")
+    print("🖼️  Image handling: ENABLED")
+    print("🔍 Advanced filtering: ENABLED")
+    print("📊 Statistics: ENABLED")
+    print("📄 Pagination: ENABLED")
+    print("⚡ Enhanced error handling: ENABLED")
+    
+    app.run(debug=True, port=5000)

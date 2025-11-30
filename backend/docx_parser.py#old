@@ -1,0 +1,223 @@
+import os
+import json
+import zipfile
+from docx import Document
+import re
+
+class DocxQuestionParser:
+    def __init__(self, upload_folder):
+        self.upload_folder = upload_folder
+        self.images_folder = os.path.join(upload_folder, 'images')
+        os.makedirs(self.images_folder, exist_ok=True)
+    
+    def extract_images_from_docx(self, docx_path):
+        """Extract images from DOCX file and return mapping of image names to filenames"""
+        images = {}
+        
+        try:
+            # Method 1: Using zipfile to extract images
+            with zipfile.ZipFile(docx_path, 'r') as docx_zip:
+                for file_info in docx_zip.filelist:
+                    if file_info.filename.startswith('word/media/'):
+                        image_filename = os.path.basename(file_info.filename)
+                        image_path = os.path.join(self.images_folder, image_filename)
+                        
+                        # Extract the image
+                        with docx_zip.open(file_info.filename) as image_file:
+                            with open(image_path, 'wb') as f:
+                                f.write(image_file.read())
+                        
+                        # Store mapping of original image reference to actual filename
+                        images[image_filename] = image_filename
+                        print(f"Extracted image: {image_filename}")  # Debug
+        except Exception as e:
+            print(f"Error extracting images: {e}")
+        
+        return images
+    
+    def extract_image_references(self, text):
+        """Extract image references from question text"""
+        # Look for patterns like ![](media/image1.jpeg)
+        image_pattern = r'!\[\]\(media/(image\d+\.[a-zA-Z]+)\)'
+        matches = re.findall(image_pattern, text)
+        return matches[0] if matches else None
+    
+    def clean_question_text(self, text):
+        """Remove image references from question text"""
+        # Remove image patterns like ![](media/image1.jpeg){...}
+        cleaned_text = re.sub(r'!\[\]\(media/image\d+\.[a-zA-Z]+\)\{[^}]+\}', '', text)
+        # Remove any extra whitespace
+        cleaned_text = re.sub(r'\n\s*\n', '\n\n', cleaned_text)
+        return cleaned_text.strip()
+    
+    def parse_docx(self, docx_path):
+        """Main method to parse DOCX file with tables"""
+        # Extract images first
+        images = self.extract_images_from_docx(docx_path)
+        print(f"Found {len(images)} images: {list(images.keys())}")  # Debug
+        
+        # Parse document content
+        document = Document(docx_path)
+        questions = []
+        current_image_index = 0
+        image_keys = list(images.keys())
+        
+        # Parse each table as a separate question
+        for table_index, table in enumerate(document.tables):
+            question_data = self.parse_question_table(table, table_index)
+            
+            if question_data and question_data.get('question_text'):
+                # Extract image reference from question text
+                image_ref = self.extract_image_references(question_data['question_text'])
+                
+                # Clean question text by removing image references
+                question_data['question_text'] = self.clean_question_text(question_data['question_text'])
+                question_data['question_html'] = question_data['question_text']
+                
+                # Assign image if found in question text
+                if image_ref and image_ref in images:
+                    question_data['image_path'] = images[image_ref]
+                    print(f"Question {table_index + 1} assigned image: {image_ref}")  # Debug
+                elif image_keys and current_image_index < len(image_keys):
+                    # Fallback: assign images in order
+                    question_data['image_path'] = image_keys[current_image_index]
+                    current_image_index += 1
+                    print(f"Question {table_index + 1} assigned fallback image: {question_data['image_path']}")  # Debug
+                
+                questions.append(question_data)
+        
+        print(f"Parsed {len(questions)} questions")  # Debug
+        return questions
+    
+    def parse_question_table(self, table, table_index):
+        """Parse a single question table"""
+        question_data = {
+            'question_text': '',
+            'type': 'multiple_choice',
+            'options': [],
+            'correct_answer': '',
+            'solution': '',
+            'marks': 1
+        }
+        
+        try:
+            for i, row in enumerate(table.rows):
+                cells = [cell.text.strip() for cell in row.cells]
+                
+                # Skip empty rows
+                if not any(cells):
+                    continue
+                
+                # Question row - spans multiple cells
+                if 'Question' in cells[0]:
+                    question_text = ''
+                    for j in range(1, len(cells)):
+                        if cells[j]:
+                            question_text += cells[j] + ' '
+                    question_data['question_text'] = question_text.strip()
+                
+                # Type row
+                elif 'Type' in cells[0]:
+                    if len(cells) > 1:
+                        question_data['type'] = cells[1].lower().strip()
+                
+                # Option rows - handle multiple options correctly
+                elif 'Option' in cells[0]:
+                    self.parse_option_row(cells, question_data)
+                
+                # Answer row
+                elif 'Answer' in cells[0]:
+                    if len(cells) > 1:
+                        question_data['correct_answer'] = cells[1]
+                
+                # Solution row
+                elif 'Solution' in cells[0]:
+                    if len(cells) > 1:
+                        question_data['solution'] = cells[1]
+                
+                # Marks row
+                elif 'Marks' in cells[0]:
+                    if len(cells) > 1:
+                        try:
+                            # Take the first marks value (ignore the second one if present)
+                            marks_text = cells[1].split()[0] if cells[1] else '1'
+                            question_data['marks'] = int(marks_text)
+                        except (ValueError, IndexError):
+                            question_data['marks'] = 1
+            
+            # Debug output for each question
+            print(f"Table {table_index + 1}: {len(question_data['options'])} options")
+            
+        except Exception as e:
+            print(f"Error parsing table {table_index}: {e}")
+        
+        return question_data
+    
+    def parse_option_row(self, cells, question_data):
+        """Parse a single option row which may contain multiple options"""
+        if len(cells) < 2:
+            return
+        
+        # The options are in cells[1], cells[2], etc.
+        for i in range(1, len(cells)):
+            option_text = cells[i].strip()
+            if not option_text:
+                continue
+                
+            # Check if this option is marked as correct
+            is_correct = 'correct' in option_text.lower()
+            
+            # Clean the option text
+            clean_text = self.clean_option_text(option_text)
+            
+            if clean_text:  # Only add if we have text
+                question_data['options'].append({
+                    'text': clean_text,
+                    'is_correct': is_correct
+                })
+    
+    def clean_option_text(self, option_text):
+        """Clean option text by removing correctness markers"""
+        # Remove common correctness indicators
+        clean_text = option_text
+        correctness_indicators = [
+            'correct', 'incorrect', 'right', 'wrong', 'true', 'false'
+        ]
+        
+        # Remove text in parentheses that indicates correctness
+        clean_text = re.sub(r'\([^)]*(correct|incorrect|right|wrong)[^)]*\)', '', clean_text, flags=re.IGNORECASE)
+        
+        # Remove standalone correctness words
+        words = clean_text.split()
+        cleaned_words = []
+        for word in words:
+            if word.lower() not in correctness_indicators:
+                cleaned_words.append(word)
+        
+        clean_text = ' '.join(cleaned_words).strip()
+        
+        # Clean up any extra spaces or punctuation
+        clean_text = re.sub(r'\s+', ' ', clean_text)
+        clean_text = clean_text.strip()
+        
+        return clean_text
+    
+    def process_options_for_question(self, question_data):
+        """Process and validate options based on question type"""
+        question_type = question_data.get('type', 'multiple_choice')
+        
+        if question_type == 'multiple_choice':
+            # Ensure we have options
+            if not question_data['options']:
+                # Create default options if none found
+                question_data['options'] = [
+                    {'text': 'Option A', 'is_correct': False},
+                    {'text': 'Option B', 'is_correct': False},
+                    {'text': 'Option C', 'is_correct': True},
+                    {'text': 'Option D', 'is_correct': False}
+                ]
+        else:
+            # For non-multiple choice questions, clear options
+            question_data['options'] = []
+        
+        return question_data
