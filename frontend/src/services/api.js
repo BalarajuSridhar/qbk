@@ -1,3 +1,4 @@
+// src/services/api.js
 import axios from 'axios';
 
 const API_BASE_URL = 'http://localhost:5000/api';
@@ -20,8 +21,8 @@ export const questionService = {
   },
 
   // Get all questions
-  getQuestions: () => {
-    return api.get('/questions');
+  getQuestions: (params) => {
+    return api.get('/questions', { params });
   },
 
   // Get single question
@@ -38,6 +39,26 @@ export const questionService = {
   deleteQuestion: (id) => {
     return api.delete(`/questions/${id}`);
   },
+
+  // Get question statistics
+  getStats: () => {
+    return api.get('/questions/stats');
+  },
+
+  // Filter questions
+  filterQuestions: (params) => {
+    return api.get('/questions/filter', { params });
+  },
+
+  // Search questions
+  searchQuestions: (searchTerm) => {
+    return api.get('/questions/search', { params: { q: searchTerm } });
+  },
+  
+  // Batch delete questions
+  batchDeleteQuestions: (questionIds) => {
+    return api.delete('/questions/batch', { data: { question_ids: questionIds } });
+  }
 };
 
 export default api;

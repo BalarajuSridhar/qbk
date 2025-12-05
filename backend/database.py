@@ -19,7 +19,7 @@ def init_db():
     if connection:
         cursor = connection.cursor()
         
-        # Create questions table
+        # In database.py, update the CREATE TABLE statement:
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS questions (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -31,6 +31,8 @@ def init_db():
                 solution TEXT,
                 marks INT,
                 image_path VARCHAR(500),
+                solution_image_path VARCHAR(500),
+                language VARCHAR(20),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )

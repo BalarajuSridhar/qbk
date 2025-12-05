@@ -511,7 +511,7 @@ def serve_image(filename):
         
         # Extract just the filename if full path is provided
         actual_filename = os.path.basename(filename)
-        image_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images', actual_filename)
+        image_path = os.path.join('uploads', 'images', actual_filename)
         
         print(f"🔍 Looking for image at: {image_path}")
         
