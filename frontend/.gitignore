@@ -18,3 +18,5 @@ pnpm-debug.log*
 # Cache
 .vite/
 .cache/
+node_modules/
+cache/
